@@ -1,0 +1,30 @@
+[
+  {
+    "ParameterKey": "Environment",
+    "ParameterValue": "dev"
+  },
+  {
+    "ParameterKey": "ImageUri",
+    "ParameterValue": "376503697510.dkr.ecr.us-west-2.amazonaws.com/wdr-mobile-item-cutoffs-lambda:REL.2026-09-22.1"
+  },
+  {
+    "ParameterKey": "AppConfigEncryptionKey",
+    "ParameterValue": "alias/pdc-general-crypto"
+  },
+  {
+    "ParameterKey": "AppConfigEncryptionKeyRegion",
+    "ParameterValue": "us-west-2"
+  },
+  {
+    "ParameterKey": "TickScheduleExpression",
+    "ParameterValue": "rate(1 minute)"
+  },
+  {
+    "ParameterKey": "ScheduleState",
+    "ParameterValue": "DISABLED"
+  },
+  {
+    "ParameterKey": "AlarmNotificationEmail",
+    "ParameterValue": ""
+  }
+]

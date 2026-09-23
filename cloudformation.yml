@@ -1,0 +1,194 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: Pdc.Mobile.ItemCutoffs - scheduled Lambda that closes groups of event items for sale at a configured time and announces the deadline in the mobile app news feed beforehand
+
+# -----------------------------------------------------------
+# PARAMETERS
+# -----------------------------------------------------------
+Parameters:
+  Environment:
+    Type: String
+    Description: Deployment environment
+    AllowedValues:
+      - prod
+      - dev
+
+  ImageUri:
+    Type: String
+    Description: Full ECR image URI including tag (e.g. 123456789.dkr.ecr.us-west-2.amazonaws.com/my-repo:REL.2026-09-22.1)
+
+  AppConfigEncryptionKey:
+    Type: String
+    Description: KMS key ID for config decryption
+
+  AppConfigEncryptionKeyRegion:
+    Type: String
+    Description: AWS region of the KMS key
+
+  LambdaRoleArn:
+    Type: String
+    Description: ARN of the IAM role to assign to the Lambda function
+    Default: "arn:aws:iam::376503697510:role/wdr-lambda-role-generic"
+
+  TickScheduleExpression:
+    Type: String
+    Default: rate(1 minute)
+    Description: >
+      How often a tick runs. One minute is the precision a sales deadline is
+      configured at. A quiet tick is a single indexed query that returns nothing,
+      so the cost is a few cents a month; raise this if the invocation count ever
+      matters more than the precision.
+
+  ScheduleState:
+    Type: String
+    Default: ENABLED
+    AllowedValues:
+      - ENABLED
+      - DISABLED
+    Description: Deploy with DISABLED for a first manual (dry) run, then update to ENABLED
+
+  AlarmNotificationEmail:
+    Type: String
+    Default: ""
+    Description: Email for the Lambda errors alarm; leave empty to create no alarm (dev)
+
+# -----------------------------------------------------------
+# CONDITIONS
+# -----------------------------------------------------------
+Conditions:
+  HasAlarmEmail: !Not [ !Equals [ !Ref AlarmNotificationEmail, "" ] ]
+
+# -----------------------------------------------------------
+# RESOURCES
+# -----------------------------------------------------------
+Resources:
+
+  # ---------------------------------------------------------
+  # LAMBDA FUNCTION (DOCKER IMAGE)
+  # Reserved concurrency 1: a tick that arrives while one is
+  # still running is throttled and dropped. Ticks must never
+  # overlap, because two of them could close the same deadline
+  # twice and post the announcement twice with it.
+  # ---------------------------------------------------------
+  MobileItemCutoffsLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "pdc-mobile-item-cutoffs-${Environment}"
+      Description: Closes sales deadlines and posts their news feed announcements
+      PackageType: Image
+      Architectures:
+        - arm64
+      Code:
+        ImageUri: !Ref ImageUri
+      Timeout: 300
+      MemorySize: 256
+      ReservedConcurrentExecutions: 1
+      Role: !Ref LambdaRoleArn
+      Environment:
+        Variables:
+          APP_CONFIG_ENCRYPTION_KEY: !Ref AppConfigEncryptionKey
+          APP_CONFIG_ENCRYPTION_KEY_REGION: !Ref AppConfigEncryptionKeyRegion
+
+  # ---------------------------------------------------------
+  # SCHEDULER ROLE
+  # EventBridge Scheduler invokes the function through this
+  # role, so no resource-based Lambda permission is needed.
+  # ---------------------------------------------------------
+  MobileItemCutoffsScheduleRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "pdc-mobile-item-cutoffs-schedule-${Environment}"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: scheduler.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: invoke-item-cutoffs
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource: !GetAtt MobileItemCutoffsLambda.Arn
+
+  # ---------------------------------------------------------
+  # SCHEDULE
+  # No retries: the next tick is the retry, a minute later, and
+  # it picks up everything still due. Async retries would only
+  # pile up behind a slow tick.
+  # ---------------------------------------------------------
+  MobileItemCutoffsSchedule:
+    Type: AWS::Scheduler::Schedule
+    Properties:
+      Name: !Sub "pdc-mobile-item-cutoffs-${Environment}"
+      Description: Runs one sales deadline tick
+      ScheduleExpression: !Ref TickScheduleExpression
+      ScheduleExpressionTimezone: UTC
+      FlexibleTimeWindow:
+        Mode: "OFF"
+      State: !Ref ScheduleState
+      Target:
+        Arn: !GetAtt MobileItemCutoffsLambda.Arn
+        RoleArn: !GetAtt MobileItemCutoffsScheduleRole.Arn
+        Input: '{"messageType": "item.cutoff.tick"}'
+        RetryPolicy:
+          MaximumRetryAttempts: 0
+          MaximumEventAgeInSeconds: 60
+
+  # ---------------------------------------------------------
+  # ERRORS ALARM (ONLY WHEN AN EMAIL IS GIVEN)
+  # The handler throws only when a tick cannot START, so this
+  # metric means "sales deadlines are not running at all". An
+  # individual deadline that fails is isolated and recorded on
+  # its own row instead.
+  # ---------------------------------------------------------
+  MobileItemCutoffsAlarmTopic:
+    Type: AWS::SNS::Topic
+    Condition: HasAlarmEmail
+    Properties:
+      TopicName: !Sub "pdc-mobile-item-cutoffs-alarms-${Environment}"
+      DisplayName: WDR mobile sales deadline alarms
+
+  MobileItemCutoffsAlarmSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: HasAlarmEmail
+    Properties:
+      TopicArn: !Ref MobileItemCutoffsAlarmTopic
+      Protocol: email
+      Endpoint: !Ref AlarmNotificationEmail
+
+  MobileItemCutoffsErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: HasAlarmEmail
+    Properties:
+      AlarmName: !Sub "pdc-mobile-item-cutoffs-errors-${Environment}"
+      AlarmDescription: The sales deadline Lambda reported an invocation error (a tick could not start)
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref MobileItemCutoffsLambda
+      Statistic: Sum
+      # Five minutes, not thirty: deadlines run to the minute, so an outage needs
+      # noticing inside the window where a contest is still closing.
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref MobileItemCutoffsAlarmTopic
+
+# -----------------------------------------------------------
+# OUTPUTS
+# -----------------------------------------------------------
+Outputs:
+  LambdaFunctionArn:
+    Value: !GetAtt MobileItemCutoffsLambda.Arn
+    Description: Lambda Function ARN
+
+  ScheduleName:
+    Value: !Ref MobileItemCutoffsSchedule
+    Description: EventBridge Scheduler schedule name

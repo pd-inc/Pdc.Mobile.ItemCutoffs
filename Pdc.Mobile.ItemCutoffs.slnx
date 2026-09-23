@@ -1,0 +1,7 @@
+<Solution>
+  <Project Path="Pdc.Mobile.ItemCutoffs.Aws.Lambda/Pdc.Mobile.ItemCutoffs.Aws.Lambda.csproj" />
+  <Project Path="Pdc.Mobile.ItemCutoffs.ConsoleHost/Pdc.Mobile.ItemCutoffs.ConsoleHost.csproj" />
+  <Project Path="Pdc.Mobile.ItemCutoffs.Runtime/Pdc.Mobile.ItemCutoffs.Runtime.csproj" />
+  <Project Path="Pdc.Mobile.ItemCutoffs.UnitTests/Pdc.Mobile.ItemCutoffs.UnitTests.csproj" />
+  <Project Path="Pdc.Mobile.ItemCutoffs/Pdc.Mobile.ItemCutoffs.csproj" />
+</Solution>

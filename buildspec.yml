@@ -1,0 +1,53 @@
+# Requires the following environment variables
+
+# AWS_ACCOUNT_ID
+# PROJECT_DIRECTORY
+# GITHUB_PACKAGE_FEED_USERNAME
+# GITHUB_PACKAGE_FEED_PASSWORD
+# BUILD_TYPE
+# IMAGE_REPOSITORY_REGION
+# IMAGE_REPOSITORY_URI
+# IMAGE_TAG_PREFIX
+# TARGET_RUNTIME (Optional - Defaults to linux-x64)
+
+version: 0.2
+
+phases:
+  install:
+    runtime-versions:
+      dotnet: 8.0
+  pre_build:
+    commands:
+      - echo Adding GitHub package source...
+      - dotnet nuget add source "https://nuget.pkg.github.com/pd-inc/index.json" --name github --username $GITHUB_PACKAGE_FEED_USERNAME --password $GITHUB_PACKAGE_FEED_PASSWORD --store-password-in-clear-text
+
+      - echo Logging in to Amazon ECR...
+      - aws ecr get-login-password --region $IMAGE_REPOSITORY_REGION | docker login --username AWS --password-stdin $AWS_ACCOUNT_ID.dkr.ecr.$IMAGE_REPOSITORY_REGION.amazonaws.com
+  build:
+    commands:
+    - WORKING_DIRECTORY=$CODEBUILD_SRC_DIR/$PROJECT_DIRECTORY
+
+    - echo Building source
+    - |
+      if [ -z "$TARGET_RUNTIME" ]; then
+        echo "TARGET_RUNTIME is not set. Using default linux-x64."
+        RUNTIME="linux-x64"
+      else
+        echo "TARGET_RUNTIME is set to $TARGET_RUNTIME"
+        RUNTIME="$TARGET_RUNTIME"
+      fi
+      dotnet publish $WORKING_DIRECTORY -c $BUILD_TYPE -r $RUNTIME -o $WORKING_DIRECTORY/bin/publish
+    - echo Successfully built source
+
+    - echo Building image
+    - docker build --no-cache -t $IMAGE_REPOSITORY_URI -f $WORKING_DIRECTORY/Dockerfile $WORKING_DIRECTORY
+    - echo Image successfully built
+
+    - echo Building image tag name
+    - IMAGE_TAG=$IMAGE_TAG_PREFIX.$(date +%Y-%m-%d).$CODEBUILD_BUILD_NUMBER
+
+    - echo Tagging image
+    - docker tag $IMAGE_REPOSITORY_URI:latest $IMAGE_REPOSITORY_URI:$IMAGE_TAG
+
+    - echo Uploading image
+    - docker push $IMAGE_REPOSITORY_URI:$IMAGE_TAG
