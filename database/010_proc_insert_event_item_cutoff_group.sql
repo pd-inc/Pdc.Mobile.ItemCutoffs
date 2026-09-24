@@ -36,7 +36,7 @@ CREATE PROCEDURE insert_event_item_cutoff_group(
 	IN eicg_post_status VARCHAR(20),
 	IN eicg_created_by_patron INT,
 	IN eicg_created_by_name VARCHAR(255),
-	OUT last_insert_id INT
+	OUT last_inserted_id INT
 )
 BEGIN
 	INSERT INTO event_item_cutoff_group (
@@ -88,7 +88,7 @@ BEGIN
 		UTC_TIMESTAMP()
 	);
 
-	SET last_insert_id = LAST_INSERT_ID();
+	SET last_inserted_id = LAST_INSERT_ID();
 END$$
 
 DELIMITER ;
