@@ -12,6 +12,8 @@ using Pdc.Mobile.ItemCutoffs.Repositories;
 using Pdc.Mobile.ItemCutoffs.Repositories.Abstract;
 using Pdc.Mobile.ItemCutoffs.Services;
 using Pdc.Mobile.ItemCutoffs.Services.Abstract;
+using Pdc.Mobile.ItemCutoffs.Services.Email;
+using Pdc.Mobile.ItemCutoffs.Services.Email.Abstract;
 using System.Text;
 using System.Text.Json;
 
@@ -39,6 +41,10 @@ public class CompositionRoot
     private const string ConfigEcommerceCacheUri = "ecommerce:cacheUri";
     private const string ConfigEcommerceCacheKey = "ecommerce:cacheKey";
     private const string ConfigMaxAttempts = "cutoff:maxAttempts";
+    private const string ConfigSmtpHost = "smtp:host";
+    private const string ConfigSmtpUsername = "smtp:username";
+    private const string ConfigSmtpPassword = "smtp:password";
+    private const string ConfigEmailFromAddress = "email:fromAddress";
 
     private const string DefaultSqsRegion = "us-west-2";
 
@@ -75,6 +81,18 @@ public class CompositionRoot
 
         var sqsRegion = configuration[ConfigNotificationsRegion] ?? DefaultSqsRegion;
 
+        // Email configuration. Required: both emails are how the registration desk
+        // learns to stop selling, so a missing value is a misconfiguration rather
+        // than a feature that quietly does nothing.
+        var smtpHost = configuration[ConfigSmtpHost]
+            ?? throw new InvalidOperationException($"Missing configuration: {ConfigSmtpHost}");
+        var smtpUsername = configuration[ConfigSmtpUsername]
+            ?? throw new InvalidOperationException($"Missing configuration: {ConfigSmtpUsername}");
+        var smtpPassword = configuration[ConfigSmtpPassword]
+            ?? throw new InvalidOperationException($"Missing configuration: {ConfigSmtpPassword}");
+        var emailFromAddress = configuration[ConfigEmailFromAddress]
+            ?? throw new InvalidOperationException($"Missing configuration: {ConfigEmailFromAddress}");
+
         var options = new ItemCutoffOptions
         {
             MaxAttempts = ResolveMaxAttempts(configuration)
@@ -103,6 +121,7 @@ public class CompositionRoot
         builder.RegisterInstance(new HttpClient()).SingleInstance();
         builder.RegisterInstance(options).SingleInstance();
         builder.RegisterType<UtcClock>().As<IUtcClock>().SingleInstance();
+        builder.RegisterType<EventTimeZoneResolver>().As<IEventTimeZoneResolver>().SingleInstance();
 
         builder.RegisterInstance<IAmazonSQS>(
             new AmazonSQSClient(RegionEndpoint.GetBySystemName(sqsRegion)))
@@ -183,6 +202,32 @@ public class CompositionRoot
             .SingleInstance();
 
         ///////////////////////////
+        // EMAIL
+        ///////////////////////////
+
+        builder.Register(c => new ItemCutoffRecipientResolver(
+                logger,
+                c.Resolve<IFindEventUsersByRoleRepository>()))
+            .As<IItemCutoffRecipientResolver>()
+            .SingleInstance();
+
+        builder.Register(c => new SmtpItemCutoffEmailSender(
+                logger,
+                smtpHost,
+                smtpUsername,
+                smtpPassword,
+                emailFromAddress))
+            .As<IItemCutoffEmailSender>()
+            .SingleInstance();
+
+        builder.Register(c => new ItemCutoffEmailService(
+                logger,
+                c.Resolve<IItemCutoffRecipientResolver>(),
+                c.Resolve<IItemCutoffEmailSender>()))
+            .As<IItemCutoffEmailService>()
+            .SingleInstance();
+
+        ///////////////////////////
         // ORCHESTRATOR
         ///////////////////////////
 
@@ -192,6 +237,8 @@ public class CompositionRoot
                 c.Resolve<IAnnouncementPublisher>(),
                 c.Resolve<IItemCutoffApplier>(),
                 c.Resolve<IEcommerceCacheService>(),
+                c.Resolve<IItemCutoffEmailService>(),
+                c.Resolve<IEventTimeZoneResolver>(),
                 c.Resolve<IUtcClock>(),
                 c.Resolve<ItemCutoffOptions>()))
             .As<IItemCutoffExecutorService>()

@@ -40,14 +40,22 @@ BEGIN
 		eics.eics_digest_local_time,
 		eics.eics_time_zone,
 		eics.eics_digest_last_sent_local_date,
+		eics.eics_digest_requested_for_date,
 		eics.eics_completed_email_enabled,
 		eics.eics_updated_utc
 	FROM event_item_cutoff_settings eics
 		INNER JOIN event ON (event.id_event = eics.event_id_event)
-	WHERE eics.eics_digest_enabled = 1
-		AND (
-			eics.eics_digest_last_sent_local_date IS NULL
-			OR eics.eics_digest_last_sent_local_date < DATE(DATE_ADD(v_now, INTERVAL 14 HOUR))
+	WHERE
+		-- An on-demand request is actioned whatever the schedule says. An event
+		-- that wants no daily mail but wants today's list is a real case, so this
+		-- deliberately ignores both eics_digest_enabled and the last-sent guard.
+		eics.eics_digest_requested_for_date IS NOT NULL
+		OR (
+			eics.eics_digest_enabled = 1
+			AND (
+				eics.eics_digest_last_sent_local_date IS NULL
+				OR eics.eics_digest_last_sent_local_date < DATE(DATE_ADD(v_now, INTERVAL 14 HOUR))
+			)
 		)
 	ORDER BY eics.event_id_event ASC;
 END$$

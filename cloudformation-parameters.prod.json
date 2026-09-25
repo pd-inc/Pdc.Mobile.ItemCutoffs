@@ -21,7 +21,7 @@
   },
   {
     "ParameterKey": "ScheduleState",
-    "ParameterValue": "DISABLED"
+    "ParameterValue": "ENABLED"
   },
   {
     "ParameterKey": "AlarmNotificationEmail",

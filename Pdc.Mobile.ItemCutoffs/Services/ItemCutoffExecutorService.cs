@@ -4,6 +4,7 @@ using Pdc.EventPro.Domain.Enumerations;
 using Pdc.EventPro.Repositories;
 using Pdc.Mobile.ItemCutoffs.Models;
 using Pdc.Mobile.ItemCutoffs.Services.Abstract;
+using Pdc.Mobile.ItemCutoffs.Services.Email.Abstract;
 
 namespace Pdc.Mobile.ItemCutoffs.Services;
 
@@ -33,6 +34,8 @@ public class ItemCutoffExecutorService : IItemCutoffExecutorService
     private readonly IAnnouncementPublisher announcementPublisher;
     private readonly IItemCutoffApplier cutoffApplier;
     private readonly IEcommerceCacheService cacheService;
+    private readonly IItemCutoffEmailService emailService;
+    private readonly IEventTimeZoneResolver timeZoneResolver;
     private readonly IUtcClock clock;
     private readonly ItemCutoffOptions options;
 
@@ -42,6 +45,8 @@ public class ItemCutoffExecutorService : IItemCutoffExecutorService
         IAnnouncementPublisher announcementPublisher,
         IItemCutoffApplier cutoffApplier,
         IEcommerceCacheService cacheService,
+        IItemCutoffEmailService emailService,
+        IEventTimeZoneResolver timeZoneResolver,
         IUtcClock clock,
         ItemCutoffOptions options)
     {
@@ -50,6 +55,8 @@ public class ItemCutoffExecutorService : IItemCutoffExecutorService
         this.announcementPublisher = announcementPublisher;
         this.cutoffApplier = cutoffApplier;
         this.cacheService = cacheService;
+        this.emailService = emailService;
+        this.timeZoneResolver = timeZoneResolver;
         this.clock = clock;
         this.options = options;
     }
@@ -77,12 +84,18 @@ public class ItemCutoffExecutorService : IItemCutoffExecutorService
         {
             // Debug, not Information: a quiet tick happens 1,440 times a day and
             // logging it at Information would bury the ticks that did something.
-            logger.LogDebug("{FeatureKey} Nothing due at {NowUtc:o}", LogProperties.TickStarted, now);
-            return summary;
+            //
+            // NOT an early return. Digests are independent of deadlines and are
+            // usually due on a tick where nothing is closing - the digest goes out
+            // in the morning and the contests close in the afternoon - so
+            // returning here would mean the digest almost never sent.
+            logger.LogDebug("{FeatureKey} No sales deadline due at {NowUtc:o}", LogProperties.TickStarted, now);
         }
-
-        logger.LogInformation("{FeatureKey} {GroupCount} sales deadline(s) due at {NowUtc:o}{DryRunSuffix}",
-            LogProperties.TickStarted, due.Count, now, trigger.DryRun ? " (dry run)" : string.Empty);
+        else
+        {
+            logger.LogInformation("{FeatureKey} {GroupCount} sales deadline(s) due at {NowUtc:o}{DryRunSuffix}",
+                LogProperties.TickStarted, due.Count, now, trigger.DryRun ? " (dry run)" : string.Empty);
+        }
 
         foreach (var group in due)
         {
@@ -113,14 +126,22 @@ public class ItemCutoffExecutorService : IItemCutoffExecutorService
             summary.CacheCleared = await cacheService.InvalidateCacheAsync();
         }
 
-        logger.LogInformation(
-            "{FeatureKey} Tick finished: {GroupsEvaluated} evaluated, {AnnouncementsSent} posted, {AnnouncementsSkipped} skipped, {CutoffsApplied} closed, {ItemsClosed} product row(s), cache cleared {CacheCleared}",
+        await ProcessDigests(now, trigger.DryRun, summary);
+
+        // A tick that did nothing at all still happens 1,440 times a day, so the
+        // summary is only worth an Information line when something happened.
+        var didSomething = summary.GroupsEvaluated > 0 || summary.DigestsSent > 0;
+
+        logger.Log(
+            didSomething ? LogLevel.Information : LogLevel.Debug,
+            "{FeatureKey} Tick finished: {GroupsEvaluated} evaluated, {AnnouncementsSent} posted, {AnnouncementsSkipped} skipped, {CutoffsApplied} closed, {ItemsClosed} product row(s), {DigestsSent} digest(s), cache cleared {CacheCleared}",
             LogProperties.TickCompleted,
             summary.GroupsEvaluated,
             summary.AnnouncementsSent,
             summary.AnnouncementsSkipped,
             summary.CutoffsApplied,
             summary.ItemsClosed,
+            summary.DigestsSent,
             summary.CacheCleared);
 
         return summary;
@@ -219,6 +240,10 @@ public class ItemCutoffExecutorService : IItemCutoffExecutorService
             {
                 cutoffRepository.SetCutoffOutcome(group.Id, ItemCutoffStatusType.Completed.ToString().ToLowerInvariant(), closed, null);
             }
+
+            // AFTER the outcome is recorded, so a mail failure cannot leave a
+            // completed cutoff looking unfinished and get it retried.
+            await SendCompletedEmailIfEnabled(group, closed, dryRun);
         }
         catch (Exception ex)
         {
@@ -235,6 +260,168 @@ public class ItemCutoffExecutorService : IItemCutoffExecutorService
                 RecordRetryableCutoffFailure(group, ex);
             }
         }
+    }
+
+    ///////////////////////////////////////////////
+    /// EMAIL
+    ///////////////////////////////////////////////
+
+    /// <summary>
+    /// Emails the registration team that a deadline has closed, when the event
+    /// has that switched on.
+    ///
+    /// This is the only thing that makes the POINT OF SALE stop selling: the
+    /// database write hides the items from non-admin staff, but a running
+    /// WinClient serves from its own cache until its operator clears it.
+    /// </summary>
+    private async Task SendCompletedEmailIfEnabled(EventItemCutoffGroup group, int itemsClosed, bool dryRun)
+    {
+        var settings = cutoffRepository.FindSettings(group.EventId);
+
+        // No settings row means the event has never been configured, and the
+        // default is ON: the point of sale instruction matters more than an
+        // unwanted email, and an admin can switch it off.
+        if (settings != null && !settings.CompletedEmailEnabled)
+        {
+            return;
+        }
+
+        await emailService.SendCutoffCompleted(group, itemsClosed, dryRun);
+    }
+
+    ///////////////////////////////////////////////
+    /// DIGESTS
+    ///////////////////////////////////////////////
+
+    /// <summary>
+    /// Sends any daily digest that is due, and any an admin has asked for.
+    ///
+    /// The candidate query is coarse because MariaDB cannot resolve an IANA zone,
+    /// so the real decision is made here: convert the tick to the event's local
+    /// time, and send when the configured time has passed and today's has not
+    /// gone yet.
+    /// </summary>
+    private async Task ProcessDigests(DateTime now, bool dryRun, ItemCutoffRunSummary summary)
+    {
+        List<EventItemCutoffSettings> candidates;
+
+        try
+        {
+            candidates = cutoffRepository.FindSettingsDue(now);
+        }
+        catch (Exception ex)
+        {
+            logger.LogError(ex, "{FeatureKey} Could not read the digest candidates", LogProperties.DigestFailed);
+            return;
+        }
+
+        foreach (var settings in candidates)
+        {
+            try
+            {
+                await ProcessDigest(settings, now, dryRun, summary);
+            }
+            catch (Exception ex)
+            {
+                // Isolated like the deadlines: one event's bad zone or bad address
+                // must not stop another event's digest.
+                logger.LogError(ex, "{FeatureKey} Digest failed for EventId {EventId}",
+                    LogProperties.DigestFailed, settings.EventId);
+            }
+        }
+    }
+
+    /// <summary>
+    /// Decides whether one event's digest is due, and sends it.
+    /// </summary>
+    private async Task ProcessDigest(EventItemCutoffSettings settings, DateTime now, bool dryRun, ItemCutoffRunSummary summary)
+    {
+        if (!timeZoneResolver.IsKnownTimeZone(settings.TimeZone))
+        {
+            logger.LogWarning("{FeatureKey} EventId {EventId} has an unrecognised digest time zone '{TimeZone}'",
+                LogProperties.DigestFailed, settings.EventId, settings.TimeZone);
+            return;
+        }
+
+        var eventNow = timeZoneResolver.ToLocal(now, settings.TimeZone);
+
+        // An explicit request wins over the schedule, and is honoured even when
+        // the daily digest is switched off.
+        var requested = settings.DigestRequestedForDate;
+        var isOnDemand = requested.HasValue;
+
+        var localDate = isOnDemand ? requested!.Value.Date : eventNow.Date;
+
+        if (!isOnDemand && !IsScheduledDigestDue(settings, eventNow))
+        {
+            return;
+        }
+
+        var deadlines = LoadDeadlinesForLocalDate(settings.EventId, localDate);
+        var sent = await emailService.SendDigest(settings, localDate, eventNow.Date, deadlines, dryRun);
+
+        if (sent)
+        {
+            summary.DigestsSent++;
+        }
+
+        if (dryRun)
+        {
+            return;
+        }
+
+        if (isOnDemand)
+        {
+            // Cleared whether or not the send worked. An admin who sees no email
+            // presses the button again, which is more predictable than retrying a
+            // bad address on every tick forever.
+            cutoffRepository.SetDigestRequested(settings.EventId, null);
+        }
+        else if (sent)
+        {
+            // Only stamped on success, so a failed scheduled send is retried on
+            // the next tick rather than silently skipped for the day.
+            cutoffRepository.SetDigestSent(settings.EventId, localDate);
+        }
+    }
+
+    /// <summary>
+    /// True when the event's local time has passed the configured send time and
+    /// today's digest has not already gone.
+    /// </summary>
+    private static bool IsScheduledDigestDue(EventItemCutoffSettings settings, DateTime eventNow)
+    {
+        if (!settings.DigestEnabled)
+        {
+            return false;
+        }
+
+        if (eventNow.TimeOfDay < settings.DigestLocalTime)
+        {
+            return false;
+        }
+
+        return settings.DigestLastSentLocalDate?.Date != eventNow.Date;
+    }
+
+    /// <summary>
+    /// The event's deadlines closing on one local date, with their items loaded.
+    ///
+    /// Filtered on the WALL CLOCK date rather than the UTC instant, because the
+    /// digest reports an event's day as the event experiences it.
+    /// </summary>
+    private List<EventItemCutoffGroup> LoadDeadlinesForLocalDate(int eventId, DateTime localDate)
+    {
+        var deadlines = cutoffRepository.FindByEventId(eventId)
+            .Where(deadline => deadline.CutoffLocal.Date == localDate.Date)
+            .ToList();
+
+        foreach (var deadline in deadlines)
+        {
+            deadline.Items = cutoffRepository.FindItems(deadline.Id);
+        }
+
+        return deadlines;
     }
 
     ///////////////////////////////////////////////

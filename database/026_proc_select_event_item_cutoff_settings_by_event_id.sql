@@ -22,6 +22,7 @@ BEGIN
 		eics.eics_digest_local_time,
 		eics.eics_time_zone,
 		eics.eics_digest_last_sent_local_date,
+		eics.eics_digest_requested_for_date,
 		eics.eics_completed_email_enabled,
 		eics.eics_updated_utc
 	FROM event_item_cutoff_settings eics

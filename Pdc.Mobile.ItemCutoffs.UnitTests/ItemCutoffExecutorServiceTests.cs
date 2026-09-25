@@ -6,7 +6,9 @@ using Pdc.EventPro.Domain.Enumerations;
 using Pdc.EventPro.Repositories;
 using Pdc.Mobile.ItemCutoffs.Models;
 using Pdc.Mobile.ItemCutoffs.Services;
+using Pdc.EventPro.Domain.Entities;
 using Pdc.Mobile.ItemCutoffs.Services.Abstract;
+using Pdc.Mobile.ItemCutoffs.Services.Email.Abstract;
 
 namespace Pdc.Mobile.ItemCutoffs.UnitTests;
 
@@ -30,6 +32,7 @@ public class ItemCutoffExecutorServiceTests
     private Mock<IAnnouncementPublisher> publisher = null!;
     private Mock<IItemCutoffApplier> applier = null!;
     private Mock<IEcommerceCacheService> cache = null!;
+    private Mock<IItemCutoffEmailService> email = null!;
     private ItemCutoffExecutorService service = null!;
 
     [TestInitialize]
@@ -39,11 +42,17 @@ public class ItemCutoffExecutorServiceTests
         publisher = new Mock<IAnnouncementPublisher>();
         applier = new Mock<IItemCutoffApplier>();
         cache = new Mock<IEcommerceCacheService>();
+        email = new Mock<IItemCutoffEmailService>();
 
         repository.Setup(x => x.FindItems(It.IsAny<int>())).Returns(new List<EventItemCutoffGroupItem>());
         publisher.Setup(x => x.Publish(It.IsAny<EventItemCutoffGroup>(), It.IsAny<bool>())).ReturnsAsync("post-abc");
         applier.Setup(x => x.Apply(It.IsAny<EventItemCutoffGroup>(), It.IsAny<bool>())).ReturnsAsync(4);
         cache.Setup(x => x.InvalidateCacheAsync()).ReturnsAsync(true);
+
+        // No settings row by default: an unconfigured event still gets the
+        // completed email, because the point of sale instruction matters more.
+        repository.Setup(x => x.FindSettings(It.IsAny<int>())).Returns((EventItemCutoffSettings?)null);
+        repository.Setup(x => x.FindSettingsDue(It.IsAny<DateTime>())).Returns(new List<EventItemCutoffSettings>());
 
         var clock = new Mock<IUtcClock>();
         clock.SetupGet(x => x.UtcNow).Returns(Now);
@@ -54,6 +63,8 @@ public class ItemCutoffExecutorServiceTests
             publisher.Object,
             applier.Object,
             cache.Object,
+            email.Object,
+            new EventTimeZoneResolver(),
             clock.Object,
             new ItemCutoffOptions());
     }
